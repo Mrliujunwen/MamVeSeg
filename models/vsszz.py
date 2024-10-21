@@ -1282,7 +1282,6 @@ class VSSBlock(nn.Module):
         **kwargs,
     ):
         super().__init__()
-        hidden_dim=int(hidden_dim*2)
         self.ln_1 = norm_layer(hidden_dim)
         self.dim = d_state
         self.self_attention = SS2D(d_model=hidden_dim, dropout=attn_drop_rate, d_state=d_state, **kwargs)
@@ -1294,14 +1293,10 @@ class VSSBlock(nn.Module):
 
         B, L,C = input.shape
         # print("dim:",self.dim)
-        input = rearrange(input,'b  (h w) c -> b h w c',b=B,c=C,h=int(self.size[0]/2),w=int(self.size[1]/2))
-        # input = rearrange(input,'b  (h w) c -> b h w c',b=B,c=C,h=int(self.size[0]),w=int(self.size[1]))
-
+        input = rearrange(input,'b  (h w) c -> b h w c',b=B,c=C,h=self.size[0],w=self.size[1])
         x = input + self.drop_path(self.self_attention(self.ln_1(input)))
         # print("x:", input.shape)
-        # x = rearrange(x, 'b h w c -> b  (h w) c', b=B, c=C, h=int(self.size[0]),w=int(self.size[1]))
-
-        x = rearrange(x, 'b h w c -> b  (h w) c', b=B, c=C, h=int(self.size[0]/2),w=int(self.size[1]/2))
+        x = rearrange(x, 'b h w c -> b  (h w) c', b=B, c=C, h=self.size[0],w=self.size[1])
         return x
 class SS2D(nn.Module):
     def __init__(
@@ -1642,5 +1637,452 @@ class PatchMerging2D(nn.Module):
         return x
 
 
+
+class TransNuSeg(nn.Module):
+    r""" 
+    Args:
+        img_size (int | tuple(int)): Input image size. Default 512x512
+        patch_size (int | tuple(int)): Patch size. Default: 4
+        in_chans (int): Number of input image channels. Default: 3 #1 if used Radiology dataset
+        num_classes (int): Number of classes for classification head. Default: 2
+        embed_dim (int): Patch embedding dimension. Default: 96
+        depths (tuple(int)): Depth of each Swin Transformer layer. default [2,2,2,2]
+        num_heads (tuple(int)): Number of attention heads in different layers, default 3,6,12,24.
+        window_size (int): Window size. Default: 8
+        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim. Default: 4
+        qkv_bias (bool): If True, add a learnable bias to query, key, value. Default: True
+        qk_scale (float): Override default qk scale of head_dim ** -0.5 if set. Default: None
+        drop_rate (float): Dropout rate. Default: 0
+        attn_drop_rate (float): Attention dropout rate. Default: 0
+        drop_path_rate (float): Stochastic depth rate. Default: 0.1
+        norm_layer (nn.Module): Normalization layer. Default: nn.LayerNorm.
+        ape (bool): If True, add absolute position embedding to the patch embedding. Default: False
+        patch_norm (bool): If True, add normalization after patch embedding. Default: True
+        use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False
+        shared_ratio: sharing ratio between decoders, Default: 0.5
+    """
+
+    def __init__(self, img_size=512, patch_size=4, in_chans=3, num_classes=2,
+                 embed_dim=96, depths=[2, 2, 2, 2], depths_decoder=[1, 2, 2, 2], num_heads=[3, 6, 12, 24],
+                 window_size=8, mlp_ratio=4., qkv_bias=True, qk_scale=None,
+                 drop_rate=0., attn_drop_rate=0., drop_path_rate=0.1,
+                 norm_layer=nn.LayerNorm, ape=False, patch_norm=True,dims=[96, 192, 384, 768], dims_decoder=[768, 384, 192, 96], d_state=16,
+                 use_checkpoint=False, final_upsample="expand_first", shared_ratio = 0.5,**kwargs):
+        super().__init__()
+
+        self.num_classes = num_classes
+        self.num_layers = len(depths)
+        self.embed_dim = embed_dim
+        self.ape = ape
+        self.patch_norm = patch_norm
+        self.num_features = int(embed_dim * 2 ** (self.num_layers - 1))
+        self.num_features_up = int(embed_dim * 2)
+        self.mlp_ratio = mlp_ratio
+        self.final_upsample = final_upsample
+
+        # split image into non-overlapping patches
+        self.patch_embed = PatchEmbed(
+            img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim,
+            norm_layer=norm_layer if self.patch_norm else None)
+        num_patches = self.patch_embed.num_patches
+        patches_resolution = self.patch_embed.patches_resolution
+        self.patches_resolution = patches_resolution
+
+        # absolute position embedding
+        if self.ape:
+            self.absolute_pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim))
+            trunc_normal_(self.absolute_pos_embed, std=.02)
+
+        self.pos_drop = nn.Dropout(p=drop_rate)
+
+        # stochastic depth
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]  # stochastic depth decay rule
+
+        ####################################### Down-sampling #######################################
+        # build encoder and bottleneck layers
+        self.layers = nn.ModuleList()
+        # #print("self.num_layers,",self.num_layers)
+        qkv_lists_dict = {}
+        # for i_layer in range(self.num_layers):
+        #     # #print("i_layer",i_layer)
+        #     if i_layer < self.num_layers -1:
+        #         layer = BasicLayer(dim=int(embed_dim * 2 ** i_layer),
+        #                         input_resolution=(patches_resolution[0] // (2 ** i_layer),
+        #                                             patches_resolution[1] // (2 ** i_layer)),
+        #                         depth=depths[i_layer],
+        #                         num_heads=num_heads[i_layer],
+        #                         window_size=window_size,
+        #                         mlp_ratio=self.mlp_ratio,
+        #                         qkv_bias=qkv_bias, qk_scale=qk_scale,
+        #                         drop=drop_rate, attn_drop=attn_drop_rate,
+        #                         drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
+        #                         norm_layer=norm_layer,
+        #                         downsample=PatchMerging if (i_layer < self.num_layers - 1) else None,
+        #                         use_checkpoint=use_checkpoint)
+        #     else:
+        #         ##### bottleneck
+        #         layer = shiftedBlock(
+        #    4         dim=int(embed_dim * 2 ** i_layer), num_heads=num_heads[i_layer], mlp_ratio=1, qkv_bias=qkv_bias, qk_scale=qk_scale,
+        #             drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])][0],
+        #             norm_layer=norm_layer,sr_ratio=8,input_resolution=(patches_resolution[0] // (2 ** i_layer),patches_resolution[1] // (2 ** i_layer)))
+        #     self.layers.append(layer)
+
+
+        self.vsslayers = nn.ModuleList()
+
+        for i_layer in range(self.num_layers):
+            if i_layer < self.num_layers - 1:
+                layer = VSSLayer(
+                    dim=dims[i_layer],
+                    depth=depths[i_layer],
+                    d_state=math.ceil(dims[0] / 6) if d_state is None else d_state,  # 20240109
+                    drop=drop_rate,
+                    attn_drop=attn_drop_rate,
+                    drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
+                    norm_layer=norm_layer,
+                    downsample=PatchMerging2D if (i_layer < self.num_layers - 1) else None,
+                    use_checkpoint=use_checkpoint,
+                )
+                # SwinTransformerBlock(input_resolution=img_size//patch_size)
+
+                self.vsslayers.append(layer)
+                if i_layer==1 or i_layer==2 or i_layer == 0:
+                    i_layer=i_layer+1
+                    layer = BasicLayer(
+                        dim=dims[i_layer],
+                                       input_resolution=(patches_resolution[0] // (2 ** i_layer),
+                                                         patches_resolution[1] // (2 ** i_layer)),
+                                       depth=depths[i_layer],
+                                       num_heads=num_heads[i_layer],
+                                       window_size=window_size,
+                                       mlp_ratio=self.mlp_ratio,
+                                       qkv_bias=qkv_bias, qk_scale=qk_scale,
+                                       drop=drop_rate, attn_drop=attn_drop_rate,
+                                       drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
+                                       norm_layer=norm_layer,
+                                       # downsample=PatchMerging if (i_layer < self.num_layers - 1) else None,
+                                       downsample=None,
+                        use_checkpoint=use_checkpoint)
+                    self.vsslayers.append(layer)
+            else:
+                ##### bottleneck
+                layer = shiftedBlock(
+                    dim=int(embed_dim * 2 ** i_layer), num_heads=num_heads[i_layer], mlp_ratio=1, qkv_bias=qkv_bias, qk_scale=qk_scale,
+                    drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])][0],
+                    norm_layer=norm_layer,sr_ratio=8,input_resolution=(patches_resolution[0] // (2 ** i_layer),patches_resolution[1] // (2 ** i_layer)))
+                self.vsslayers.append(layer)
+        # build decoder layers
+        self.layers_up = nn.ModuleList()
+        self.layers_up2 = nn.ModuleList() # Normal edge decoder
+        self.layers_up3 = nn.ModuleList() # Cluster edge decoder
+
+        self.concat_back_dim = nn.ModuleList()
+        self.concat_back_dim2 = nn.ModuleList()
+        self.concat_back_dim3 = nn.ModuleList()
+        ####################################### Up-sampling #######################################
+        for i_layer in range(self.num_layers):
+            qkv_lists = []
+            for i in range(depths[i_layer]):
+                dim = int(embed_dim * 2 ** (self.num_layers-1-i_layer))
+                qkv_lists.append(nn.Linear(dim, dim * 3, bias=qkv_bias))
+            concat_linear = nn.Linear(2*int(embed_dim*2**(self.num_layers-1-i_layer)),
+            int(embed_dim*2**(self.num_layers-1-i_layer))) if i_layer > 0 else nn.Identity()
+
+            
+
+            if i_layer ==0 :
+                layer_up = PatchExpand(input_resolution=(patches_resolution[0] // (2 ** (self.num_layers-1-i_layer)),
+                patches_resolution[1] // (2 ** (self.num_layers-1-i_layer))), dim=int(embed_dim * 2 ** (self.num_layers-1-i_layer)), dim_scale=2, norm_layer=norm_layer)
+
+                
+            else:
+                layer_up = BasicLayer_up(dim=int(embed_dim * 2 ** (self.num_layers-1-i_layer)),
+                                input_resolution=(patches_resolution[0] // (2 ** (self.num_layers-1-i_layer)),
+                                                    patches_resolution[1] // (2 ** (self.num_layers-1-i_layer))),
+                                depth=depths[(self.num_layers-1-i_layer)],
+                                num_heads=num_heads[(self.num_layers-1-i_layer)],
+                                window_size=window_size,
+                                mlp_ratio=self.mlp_ratio,
+                                qkv_lists=qkv_lists, qk_scale=qk_scale,
+                                drop=drop_rate, attn_drop=attn_drop_rate,
+                                drop_path=dpr[sum(depths[:(self.num_layers-1-i_layer)]):sum(depths[:(self.num_layers-1-i_layer) + 1])],
+                                norm_layer=norm_layer,
+                                upsample=PatchExpand if (i_layer < self.num_layers - 1) else None,
+                                use_checkpoint=use_checkpoint)
+            self.layers_up.append(layer_up)
+            self.concat_back_dim.append(concat_linear)
+
+            if i_layer < self.num_layers-1:
+                if i_layer ==0 :
+                    layer_up2 = PatchExpand(input_resolution=(patches_resolution[0] // (2 ** (self.num_layers-1-i_layer)),
+                    patches_resolution[1] // (2 ** (self.num_layers-1-i_layer))), dim=int(embed_dim * 2 ** (self.num_layers-1-i_layer)), dim_scale=2, norm_layer=norm_layer)
+                else:
+                    #下面是share的
+                    layer_up2 = Shared_BasicLayer_up(dim=int(embed_dim * 2 ** (self.num_layers-1-i_layer)),
+                                    input_resolution=(patches_resolution[0] // (2 ** (self.num_layers-1-i_layer)),
+                                                        patches_resolution[1] // (2 ** (self.num_layers-1-i_layer))),
+                                    depth=depths[(self.num_layers-1-i_layer)],
+                                    num_heads=num_heads[(self.num_layers-1-i_layer)],
+                                    window_size=window_size,
+                                    mlp_ratio=self.mlp_ratio,
+                                    shared_qkv_lists=qkv_lists, qk_scale=qk_scale,
+                                    drop=drop_rate, attn_drop=attn_drop_rate,
+                                    drop_path=dpr[sum(depths[:(self.num_layers-1-i_layer)]):sum(depths[:(self.num_layers-1-i_layer) + 1])],
+                                    norm_layer=norm_layer,
+                                    upsample=PatchExpand if (i_layer < self.num_layers - 1) else None,
+                                    use_checkpoint=use_checkpoint,
+                                    shared_ratio=shared_ratio)
+                    # layer_up2 = BasicLayer_up(dim=int(embed_dim * 2 ** (self.num_layers - 1 - i_layer)),
+                    #               input_resolution=(patches_resolution[0] // (2 ** (self.num_layers - 1 - i_layer)),
+                    #                                 patches_resolution[1] // (2 ** (self.num_layers - 1 - i_layer))),
+                    #               depth=depths[(self.num_layers - 1 - i_layer)],
+                    #               num_heads=num_heads[(self.num_layers - 1 - i_layer)],
+                    #               window_size=window_size,
+                    #               mlp_ratio=self.mlp_ratio,
+                    #               qkv_lists=qkv_lists, qk_scale=qk_scale,
+                    #               drop=drop_rate, attn_drop=attn_drop_rate,
+                    #               drop_path=dpr[sum(depths[:(self.num_layers - 1 - i_layer)]):sum(
+                    #                   depths[:(self.num_layers - 1 - i_layer) + 1])],
+                    #               norm_layer=norm_layer,
+                    #               upsample=PatchExpand if (i_layer < self.num_layers - 1) else None,
+                    #               use_checkpoint=use_checkpoint)
+                    #
+
+
+                concat_linear2 = nn.Linear(2*int(embed_dim*2**(self.num_layers-1-i_layer)),
+                    int(embed_dim*2**(self.num_layers-1-i_layer))) if i_layer > 0 else nn.Identity()
+
+
+                self.layers_up2.append(layer_up2)
+                self.layers_up3.append(layer_up2)## edge decoders sharing parts of blocks
+                self.concat_back_dim2.append(concat_linear2)
+                self.concat_back_dim3.append(concat_linear2)
+            else:
+                concat_linear2 = nn.Linear(2*int(embed_dim*2**(self.num_layers-1-i_layer)),
+            int(embed_dim*2**(self.num_layers-1-i_layer))) if i_layer > 0 else nn.Identity()
+                concat_linear3 = nn.Linear(2*int(embed_dim*2**(self.num_layers-1-i_layer)),
+            int(embed_dim*2**(self.num_layers-1-i_layer))) if i_layer > 0 else nn.Identity()
+                #下面是share的
+
+                layer_up2 = Shared_BasicLayer_up(dim=int(embed_dim * 2 ** (self.num_layers-1-i_layer)),
+                                input_resolution=(patches_resolution[0] // (2 ** (self.num_layers-1-i_layer)),
+                                                    patches_resolution[1] // (2 ** (self.num_layers-1-i_layer))),
+                                depth=depths[(self.num_layers-1-i_layer)],
+                                num_heads=num_heads[(self.num_layers-1-i_layer)],
+                                window_size=window_size,
+                                mlp_ratio=self.mlp_ratio,
+                                shared_qkv_lists=qkv_lists, qk_scale=qk_scale,
+                                drop=drop_rate, attn_drop=attn_drop_rate,
+                                drop_path=dpr[sum(depths[:(self.num_layers-1-i_layer)]):sum(depths[:(self.num_layers-1-i_layer) + 1])],
+                                norm_layer=norm_layer,
+                                upsample=PatchExpand if (i_layer < self.num_layers - 1) else None,
+                                use_checkpoint=use_checkpoint,shared_ratio=shared_ratio)
+                layer_up3 = Shared_BasicLayer_up(dim=int(embed_dim * 2 ** (self.num_layers-1-i_layer)),
+                                input_resolution=(patches_resolution[0] // (2 ** (self.num_layers-1-i_layer)),
+                                                    patches_resolution[1] // (2 ** (self.num_layers-1-i_layer))),
+                                depth=depths[(self.num_layers-1-i_layer)],
+                                num_heads=num_heads[(self.num_layers-1-i_layer)],
+                                window_size=window_size,
+                                mlp_ratio=self.mlp_ratio,
+                                shared_qkv_lists=qkv_lists, qk_scale=qk_scale,
+                                drop=drop_rate, attn_drop=attn_drop_rate,
+                                drop_path=dpr[sum(depths[:(self.num_layers-1-i_layer)]):sum(depths[:(self.num_layers-1-i_layer) + 1])],
+                                norm_layer=norm_layer,
+                                upsample=PatchExpand if (i_layer < self.num_layers - 1) else None,
+                                use_checkpoint=use_checkpoint,shared_ratio=shared_ratio)
+                # layer_up2 = BasicLayer_up(dim=int(embed_dim * 2 ** (self.num_layers - 1 - i_layer)),
+                #                           input_resolution=(
+                #                           patches_resolution[0] // (2 ** (self.num_layers - 1 - i_layer)),
+                #                           patches_resolution[1] // (2 ** (self.num_layers - 1 - i_layer))),
+                #                           depth=depths[(self.num_layers - 1 - i_layer)],
+                #                           num_heads=num_heads[(self.num_layers - 1 - i_layer)],
+                #                           window_size=window_size,
+                #                           mlp_ratio=self.mlp_ratio,
+                #                           qkv_lists=qkv_lists, qk_scale=qk_scale,
+                #                           drop=drop_rate, attn_drop=attn_drop_rate,
+                #                           drop_path=dpr[sum(depths[:(self.num_layers - 1 - i_layer)]):sum(
+                #                               depths[:(self.num_layers - 1 - i_layer) + 1])],
+                #                           norm_layer=norm_layer,
+                #                           upsample=PatchExpand if (i_layer < self.num_layers - 1) else None,
+                #                           use_checkpoint=use_checkpoint)
+                #
+                # layer_up3 = BasicLayer_up(dim=int(embed_dim * 2 ** (self.num_layers - 1 - i_layer)),
+                #                           input_resolution=(
+                #                           patches_resolution[0] // (2 ** (self.num_layers - 1 - i_layer)),
+                #                           patches_resolution[1] // (2 ** (self.num_layers - 1 - i_layer))),
+                #                           depth=depths[(self.num_layers - 1 - i_layer)],
+                #                           num_heads=num_heads[(self.num_layers - 1 - i_layer)],
+                #                           window_size=window_size,
+                #                           mlp_ratio=self.mlp_ratio,
+                #                           qkv_lists=qkv_lists, qk_scale=qk_scale,
+                #                           drop=drop_rate, attn_drop=attn_drop_rate,
+                #                           drop_path=dpr[sum(depths[:(self.num_layers - 1 - i_layer)]):sum(
+                #                               depths[:(self.num_layers - 1 - i_layer) + 1])],
+                #                           norm_layer=norm_layer,
+                #                           upsample=PatchExpand if (i_layer < self.num_layers - 1) else None,
+                #                           use_checkpoint=use_checkpoint)
+                self.layers_up2.append(layer_up2)
+                self.layers_up3.append(layer_up3)
+                self.concat_back_dim2.append(concat_linear2)
+                self.concat_back_dim3.append(concat_linear3)
+
+
+        self.norm = norm_layer(self.num_features)
+        self.norm_up= norm_layer(self.embed_dim)
+
+        self.norm2 = norm_layer(self.num_features)
+        self.norm_up2= norm_layer(self.embed_dim)
+
+        self.norm3 = norm_layer(self.num_features)
+        self.norm_up3= norm_layer(self.embed_dim)
+
+        if self.final_upsample == "expand_first":
+            #print("---final upsample expand_first---")
+            self.up = FinalPatchExpand_X4(input_resolution=(img_size//patch_size,img_size//patch_size),dim_scale=4,dim=embed_dim)
+            self.output = nn.Conv2d(in_channels=embed_dim,out_channels=self.num_classes,kernel_size=1,bias=False)
+
+            self.up2 = FinalPatchExpand_X4(input_resolution=(img_size//patch_size,img_size//patch_size),dim_scale=4,dim=embed_dim)
+            self.output2 = nn.Conv2d(in_channels=embed_dim,out_channels=self.num_classes,kernel_size=1,bias=False)
+
+            self.up3 = FinalPatchExpand_X4(input_resolution=(img_size//patch_size,img_size//patch_size),dim_scale=4,dim=embed_dim)
+            self.output3 = nn.Conv2d(in_channels=embed_dim,out_channels=self.num_classes,kernel_size=1,bias=False)
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    @torch.jit.ignore
+    def no_weight_decay(self):
+        return {'absolute_pos_embed'}
+
+    @torch.jit.ignore
+    def no_weight_decay_keywords(self):
+        return {'relative_position_bias_table'}
+
+    #Encoder and Bottleneck
+    def forward_features(self, x):
+        x = self.patch_embed(x)
+        if self.ape:
+            x = x + self.absolute_pos_embed
+        seg_mask = self.pos_drop(x).view(1,128,128,-1)
+        edge_mask = self.pos_drop(x).view(1,128,128,-1)
+
+        seg_mask_downsample = []
+        edge_mask_downsample = []
+
+        # for layer in self.layers:
+        #     edge_mask_downsample.append(edge_mask)
+        #     seg_mask_downsample.append(seg_mask)
+        #
+        #     seg_mask = layer(seg_mask)
+        #     edge_mask = layer(edge_mask)
+
+        for layer in self.vsslayers:
+            edge_mask_downsample.append(edge_mask)
+            seg_mask_downsample.append(seg_mask)
+
+            seg_mask = layer(seg_mask)
+            edge_mask = layer(edge_mask)
+            
+            
+
+            
+
+        seg_mask = self.norm(seg_mask)  # B L C
+        edge_mask = self.norm(edge_mask)
+  
+        return seg_mask,edge_mask, seg_mask_downsample,edge_mask_downsample
+
+    #Dencoder and Skip connection
+    def forward_up_features(self, seg_mask,edge_mask, seg_mask_downsample,edge_mask_downsample):
+        # #print("forward ",self.layers_up2[0])
+        for inx in range(len(self.layers_up)):
+            if inx == 0:
+                seg_mask = self.layers_up[inx](seg_mask)
+                cluster_edge = self.layers_up3[inx](edge_mask)
+                edge_mask = self.layers_up2[inx](edge_mask)
+            else:
+                #print("shape ",seg_mask.shape,seg_mask_downsample[3-inx].shape)
+                seg_mask = torch.cat([seg_mask,seg_mask_downsample[3-inx]],-1)
+                seg_mask = self.concat_back_dim[inx](seg_mask)
+                seg_mask = self.layers_up[inx](seg_mask)
+
+                edge_mask = torch.cat([edge_mask,edge_mask_downsample[3-inx]],-1)
+                edge_mask = self.concat_back_dim2[inx](edge_mask)
+                edge_mask = self.layers_up2[inx](edge_mask)
+
+                cluster_edge = torch.cat([cluster_edge,edge_mask_downsample[3-inx]],-1)
+                cluster_edge = self.concat_back_dim3[inx](cluster_edge)
+                cluster_edge = self.layers_up3[inx](cluster_edge)
+        
+
+        seg_mask = self.norm_up(seg_mask)
+        edge_mask = self.norm_up2(edge_mask)  # B L C
+        cluster_edge = self.norm_up3(cluster_edge)
+  
+        return seg_mask,edge_mask,cluster_edge
+
+    def up_x4(self, seg_mask,edge_mask,cluster_edge):
+        H, W = self.patches_resolution
+        B, L, C = seg_mask.shape
+        assert L == H*W, "input features has wrong size"
+
+        if self.final_upsample=="expand_first":
+            seg_mask = self.up(seg_mask)
+            seg_mask = seg_mask.view(B,4*H,4*W,-1)
+            seg_mask = seg_mask.permute(0,3,1,2) #B,C,H,W
+            seg_mask = self.output(seg_mask)
+
+            edge_mask = self.up2(edge_mask)
+            edge_mask = edge_mask.view(B,4*H,4*W,-1)
+            edge_mask = edge_mask.permute(0,3,1,2) #B,C,H,W
+            edge_mask = self.output2(edge_mask)
+
+            cluster_edge = self.up3(cluster_edge)
+            cluster_edge = cluster_edge.view(B,4*H,4*W,-1)
+            cluster_edge = cluster_edge.permute(0,3,1,2) #B,C,H,W
+            cluster_edge = self.output3(cluster_edge)
+        # #print("up_x4 x size ",x.shape)
+        return seg_mask,edge_mask,cluster_edge
+
+    def forward(self, x):
+        #1,3,512,512
+        seg_mask,edge_mask, seg_mask_downsample,edge_mask_downsample = self.forward_features(x)
+        seg_mask=seg_mask.reshape(1,-1,seg_mask.shape[3])
+        edge_mask = edge_mask.reshape(1, -1, edge_mask.shape[3])
+        # seg_mask = seg_mask.reshape(1, -1, seg_mask.shape[3])
+        i = 0
+        for seg in seg_mask_downsample:
+            seg_mask_downsample[i] = seg.reshape(1, -1, seg.shape[3])
+            i += 1
+
+        j = 0
+        for seg in edge_mask_downsample:
+            edge_mask_downsample[j] = seg.reshape(1, -1, seg.shape[3])
+            j += 1
+
+        seg_mask,edge_mask,cluster_edge = self.forward_up_features(seg_mask,edge_mask, seg_mask_downsample,edge_mask_downsample)
+        # #print("forward features ", seg_mask.shape,edge_mask.shape,cluster_edge.shape)
+
+        seg_mask,edge_mask,cluster_edge = self.up_x4(seg_mask,edge_mask,cluster_edge)
+        
+
+        return seg_mask,edge_mask,cluster_edge
+
+    def flops(self):
+        flops = 0
+        flops += self.patch_embed.flops()
+        for i, layer in enumerate(self.layers):
+            flops += layer.flops()
+        flops += self.num_features * self.patches_resolution[0] * self.patches_resolution[1] // (2 ** self.num_layers)
+        flops += self.num_features * self.num_classes
+        return flops
 
 

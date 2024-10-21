@@ -1,13 +1,36 @@
-
+import copy
+import logging
+import math
+from os.path import join as pjoin
+import cv2
+import torch
+import torch.nn as nn
+import numpy as np
+import torchvision
+from torch.nn import CrossEntropyLoss, Dropout, Softmax, Linear, Conv2d, LayerNorm
+from torch.nn.modules.utils import _pair
+from scipy import ndimage
+from torchvision import transforms
 import torch.utils.checkpoint as checkpoint
-
+from einops import rearrange
+from timm.models.layers import DropPath, to_2tuple, trunc_normal_
+import os
 from torch.utils.data import Dataset, DataLoader, TensorDataset
-
+from torch.nn.modules.loss import CrossEntropyLoss
+import torch.optim as optim
+import torch.utils.data as data
+import scipy.io as sio
+import matplotlib.pyplot as plt
+import random
+import time
+import sys
+from datetime import datetime
 import argparse
 
 
 import lossfun
 
+import utils
 from dataset import MyDataset
 from utils import *
 from models.mamveseg import MamVeSeg
@@ -129,6 +152,12 @@ def main():
 
     test_loss = []
     train_loss = []
+    Acc_list = []
+    F1_list = []
+    IOU_list = []
+    SE_list = []
+    SP_list = []
+    AUC_list = []
 
     ce_loss1 = CrossEntropyLoss()
     dice_loss1 = DiceLoss(num_classes)
@@ -212,7 +241,11 @@ def main():
                 if phase == 'test':
                     acoutput1 = output1.squeeze(0).detach().cpu().numpy()#2,512,512
                     prediction = np.argmax(acoutput1, 0)#512,512
-
+                    # prediction = acoutput1[1]#512,512
+                    #
+                    # plt.imshow(prediction, cmap='gray')  # Display the ndarray as a grayscale image
+                    # plt.axis('off')  # Turn off axis
+                    # plt.show()
 
                     bout = output2.squeeze(0).detach().cpu().numpy()
                     bout= np.argmax(bout, 0)
@@ -220,7 +253,29 @@ def main():
                     cout = np.argmax(cout, 0)
 
 
+                    # metric_i = [calculate_acc(prediction, label), calculate_IoU(prediction, label), calculate_F1_score(prediction, label)]
+                    # metric_list += np.array(metric_i)
 
+                    # # 对 prediction 和 label 进行裁剪操作，保留第一个维度之外的部分
+                    # prediction = prediction[0, :, :]
+                    # label = label[0, :, :]
+
+                    # print(prediction.shape)
+                    # print(label.shape)
+
+                    IoU = calculate_IoU(prediction, label)
+                    F1_score = calculate_F1_score(prediction, label)
+                    acc = calculate_acc(prediction, label)
+                    se = compute_class_sens(prediction, label)
+                    sp = compute_class_spec(prediction, label)
+                    auc = calculate_auc (label.flatten(), prediction.flatten())
+                    # hello world
+                    acc_list += acc
+                    IoU_list += IoU
+                    F1_score_list += F1_score
+                    se_list += se
+                    sp_list += sp
+                    auc_list = auc + auc_list
 
 
 
@@ -282,6 +337,13 @@ def main():
                     optimizer.step()
             metric_list = metric_list / dataset_sizes[phase]
             e = time.time()
+            # aji_score_list = aji_score_list / dataset_sizes["test"]
+            acc_list = acc_list / dataset_sizes["test"]
+            sp_list = sp_list / dataset_sizes["test"]
+            se_list = se_list / dataset_sizes["test"]
+            IoU_list = IoU_list / dataset_sizes["test"]
+            F1_score_list = F1_score_list / dataset_sizes["test"]
+            auc_list = auc_list / dataset_sizes["test"]
 
 
             epoch_loss = running_loss / dataset_sizes[phase]
@@ -292,16 +354,30 @@ def main():
                 'Epoch {},: loss without distillation {}, {},time {}'.format(epoch + 1, epoch_loss_wo_dis, phase,
                                                                              e - s))
             logging.info('Epoch {},: loss seg {}, {},time {}'.format(epoch + 1, epoch_loss_seg, phase, e - s))
+            # logging.info(
+            #     'Mean accuracy: {:.5f}, mean IoU: {:.5f}, mean F1 score: {:.5f}'.format(metric_list[0], metric_list[1],
+            #                                                                             metric_list[2]))
 
+            # logging.info('Epoch {},: aji_score {}, {},time {}'.format(epoch+1,  aji_score_list,phase,e-s))
 
             if phase == 'train':
                 train_loss.append(epoch_loss)
-
+                # train_loss_clus.append(loss_clu)
+                # train_loss_nors.append(loss_nor)
+                # train_loss_segs.append(loss_seg)
 
             else:
                 test_loss.append(epoch_loss)
+                Acc_list.append(acc_list)
+                F1_list.append(F1_score_list)
+                IOU_list.append(IoU_list)
+                SE_list.append(se_list)
+                SP_list.append(sp_list)
+                AUC_list.append(auc_list)
 
-
+                # test_loss_clus.append(loss_clu)
+                # test_loss_nors.append(loss_nor)
+                # test_loss_segs.append(loss_seg)
 
             # if phase == 'test' and epoch_loss_seg < best_loss:
             if phase == 'test' and epoch_loss_seg < best_loss:
@@ -310,9 +386,13 @@ def main():
                 best_epoch = epoch + 1
                 best_model_wts = copy.deepcopy(model.state_dict())
                 logging.info("Best val loss {} save at epoch {}".format(best_loss, epoch + 1))
-
+        logging.info(
+            'Test: epoch {}:acc: {:.5f}, IoU: {:.5f}, F1 score: {:.5f}, SE:{:.5f}, SP:{:.5f}, AUC:{:.5f}'
+            .format(epoch + 1, acc_list, IoU_list, F1_score_list, se_list, sp_list, auc_list))
     draw_loss(train_loss, test_loss, str(now))
-
+    draw_f1(F1_list, str(now))
+    draw_acc(Acc_list, str(now))
+    draw_iou(IOU_list, str(now))
     create_dir('./saved')
     torch.save(best_model_wts, './saved/model_epoch:{}.pt'.format(best_epoch))
     logging.info(
@@ -339,8 +419,8 @@ def main():
             d_l = dice_loss_test(output1, semantic_seg_mask.float(), softmax=True)
             dice_acc_test += 1 - d_l.item()
 
-    logging.info("dice_acc {}".format(dice_acc_test/dataset_sizes['test']))
-    draw_acc(dice_acc_test/dataset_sizes['test'],str('now'))
+    # logging.info("dice_acc {}".format(dice_acc_test/dataset_sizes['test']))
+    # draw_acc(dice_acc_test/dataset_sizes['test'],str('now'))
 
 
 if __name__ == '__main__':

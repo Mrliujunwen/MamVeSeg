@@ -1292,30 +1292,52 @@ class MamVeSeg(nn.Module):
         qkv_lists_dict = {}
         for i_layer in range(self.num_layers):
             # #print("i_layer",i_layer)
-            if i_layer < self.num_layers - 1:
+            if i_layer < self.num_layers-1 :
                 # print("int(embed_dim * 2 ** i_layer):",int(embed_dim * 2 ** i_layer))
                 layer = nn.Sequential(
-                         # VSSLayer(dim=int(embed_dim * 2 ** i_layer),depth=2,drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],norm_layer=norm_layer,
-                         #          size=(patches_resolution[0] // (2 ** i_layer),
-                         #                             patches_resolution[1] // (2 ** i_layer)),
-                         #          ),
-                         VSSBlock(d_state=16,hidden_dim=int(embed_dim*2**i_layer),
-                                  drop_path=0.,
-                                  norm_layer=norm_layer,size=(patches_resolution[0]//(2**i_layer),
-                                                              patches_resolution[1]//(2**i_layer))),
-           BasicLayer(dim=int(embed_dim * 2 ** i_layer),
-                                   input_resolution=(patches_resolution[0] // (2 ** i_layer),
-                                                     patches_resolution[1] // (2 ** i_layer)),
-                                   depth=depths[i_layer],
-                                   num_heads=num_heads[i_layer],
-                                   window_size=window_size,
-                                   mlp_ratio=self.mlp_ratio,
-                                   qkv_bias=qkv_bias, qk_scale=qk_scale,
-                                   drop=drop_rate, attn_drop=attn_drop_rate,
-                                   drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
-                                   norm_layer=norm_layer,
-                                   downsample=PatchMerging if (i_layer < self.num_layers - 1) else None,
-                                   use_checkpoint=use_checkpoint))
+
+                    BasicLayer(dim=int(embed_dim * 2 ** i_layer),
+                               input_resolution=(patches_resolution[0] // (2 ** i_layer),
+                                                 patches_resolution[1] // (2 ** i_layer)),
+                               depth=depths[i_layer],
+                               num_heads=num_heads[i_layer],
+                               window_size=window_size,
+                               mlp_ratio=self.mlp_ratio,
+                               qkv_bias=qkv_bias, qk_scale=qk_scale,
+                               drop=drop_rate, attn_drop=attn_drop_rate,
+                               drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
+                               norm_layer=norm_layer,
+                               downsample=PatchMerging if (i_layer < self.num_layers - 1) else None,
+                               use_checkpoint=use_checkpoint))
+                layer2 = nn.Sequential(
+                    VSSBlock(d_state=16, hidden_dim=int(embed_dim * 2 ** i_layer),
+                             drop_path=0.,
+                             norm_layer=norm_layer, size=(patches_resolution[0] // (2 ** i_layer),
+                                                          patches_resolution[1] // (2 ** i_layer))))
+                layer3 = nn.Sequential(
+                    BasicLayer(dim=int(embed_dim * 2 ** i_layer),
+                               input_resolution=(patches_resolution[0] // (2 ** i_layer),
+                                                 patches_resolution[1] // (2 ** i_layer)),
+                               depth=depths[i_layer],
+                               num_heads=num_heads[i_layer],
+                               window_size=window_size,
+                               mlp_ratio=self.mlp_ratio,
+                               qkv_bias=qkv_bias, qk_scale=qk_scale,
+                               drop=drop_rate, attn_drop=attn_drop_rate,
+                               drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
+                               norm_layer=norm_layer,
+                               use_checkpoint=use_checkpoint))
+                # if i_layer == 2:
+
+
+                self.layers.append(layer)
+                self.layers.append(layer2)
+
+                    # self.layers.append(layer2)
+
+
+
+
             else:
                 ##### bottleneck
                 layer = shiftedBlock(
@@ -1325,7 +1347,7 @@ class MamVeSeg(nn.Module):
                     drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])][0],
                     norm_layer=norm_layer, sr_ratio=8,
                     input_resolution=(patches_resolution[0] // (2 ** i_layer), patches_resolution[1] // (2 ** i_layer)))
-            self.layers.append(layer)
+                self.layers.append(layer)
 
         # build decoder layers
         self.layers_up = nn.ModuleList()
@@ -1469,6 +1491,11 @@ class MamVeSeg(nn.Module):
                                            dim_scale=4, dim=embed_dim)
             self.output3 = nn.Conv2d(in_channels=embed_dim, out_channels=self.num_classes, kernel_size=1, bias=False)
 
+        self.conv1 = nn.Conv2d(in_channels=embed_dim*2*2, out_channels=embed_dim*2, kernel_size=1, bias=False)
+        self.conv2 = nn.Conv2d(in_channels=embed_dim*2*2*2, out_channels=embed_dim*2*2, kernel_size=1, bias=False)
+
+        self.conv3 = nn.Conv2d(in_channels=embed_dim*2*2*2*2, out_channels=embed_dim*2*2*2, kernel_size=1, bias=False)
+
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
@@ -1500,13 +1527,41 @@ class MamVeSeg(nn.Module):
         seg_mask_downsample = []
         edge_mask_downsample = []
 
-        for layer in self.layers:
-            edge_mask_downsample.append(edge_mask)
-            seg_mask_downsample.append(seg_mask)
+        for num,layer in enumerate( self.layers):
+            if num == 0:
+                edge_mask_downsample.append(edge_mask)
+                seg_mask_downsample.append(seg_mask)
+            if num==0 or num==2or num==4:
 
-            seg_mask = layer(seg_mask)
-            edge_mask = layer(edge_mask)
+            # print(f"{num,seg_mask.shape}")
 
+                base_seg_mask = layer(seg_mask)
+                base_edge_mask = layer(edge_mask)
+            if num==1 or num==3 or num==5:
+                if num==1:
+                    vss_seg_mask = layer(base_seg_mask)
+                    vss_edge_mask = layer(base_edge_mask)
+                else:
+                    vss_seg_mask = layer(base_seg_mask)
+                    vss_edge_mask = layer(base_edge_mask)
+                b,n,c=vss_seg_mask.shape
+                h=int(math.sqrt(n))
+                seg_mask=torch.cat([base_seg_mask,vss_seg_mask],dim=2).permute(0,2,1).reshape(b,c*2,h,h)
+                edge_mask=torch.cat([base_edge_mask,vss_edge_mask],dim=2).permute(0,2,1).reshape(b,c*2,h,h)
+                if num==1:
+                    seg_mask=self.conv1(seg_mask).reshape(b,c,h*h).permute(0,2,1)
+                    edge_mask=self.conv1(edge_mask).reshape(b,c,h*h).permute(0,2,1)
+                if num == 3:
+                    seg_mask = self.conv2(seg_mask).reshape(b,c,h*h).permute(0,2,1)
+                    edge_mask = self.conv2(edge_mask).reshape(b,c,h*h).permute(0,2,1)
+                if num == 5:
+                    seg_mask = self.conv3(seg_mask).reshape(b,c,h*h).permute(0,2,1)
+                    edge_mask = self.conv3(edge_mask).reshape(b,c,h*h).permute(0,2,1)
+                edge_mask_downsample.append(edge_mask)
+                seg_mask_downsample.append(seg_mask)
+
+
+            # print(f"{num,seg_mask.shape}")
         seg_mask = self.norm(seg_mask)  # B L C
         edge_mask = self.norm(edge_mask)
 

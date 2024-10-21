@@ -57,10 +57,9 @@ class ChannelCompressAttention(nn.Module):
         # q, k, v: b, n, c
         agent_tokens = self.conv1(q[:, :, :].reshape(b, h, w, c).permute(0, 3, 1, 2)).reshape(b, h*w, -1)
         agent_tokens1 = agent_tokens.permute(0,2,1)
-        # print(agent_tokens1.shape)
-
         k = k.reshape(b, n,  head_dim).permute(0, 1, 2)
         v = v.reshape(b, n,  head_dim).permute(0, 1, 2)
+        q= self.dwc(q.reshape(b, h, w, c).permute(0, 3, 1, 2))
 
         agent_attn = self.softmax((agent_tokens1 * self.scale) @ k)
 
@@ -72,7 +71,7 @@ class ChannelCompressAttention(nn.Module):
         agent_tokens = self.softmax(agent_tokens)
 
         x=agent_tokens@agent_v
-
+        x=x+q.permute(0,2,3,1).reshape(b,h*w,c)
         return x
 if __name__ == '__main__':
     attn = ChannelCompressAttention(dim=96, window_size=(16,16), num_heads=1,
